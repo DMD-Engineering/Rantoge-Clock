@@ -1,0 +1,18 @@
+arduino-esp8266fs-plugin
+https://github.com/esp8266/arduino-esp8266fs-plugin/releases/tag/0.5.0
+
+ESPAsyncWebServer
+https://github.com/me-no-dev/ESPAsyncWebServer
+
+ESP8266mDNS
+https://github.com/arduino/esp8266/tree/master/libraries/ESP8266mDNS
+
+Arduino library for AS5600 and AS5600L magnetic rotation meter
+https://www.arduino.cc/reference/en/libraries/as5600/
+
+ESP8266WiFi
+https://github.com/esp8266/Arduino/tree/master/libraries/ESP8266WiFi
+
+FS
+https://github.com/espressif/arduino-esp32/tree/master/libraries/FS
+
