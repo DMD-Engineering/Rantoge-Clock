@@ -22,8 +22,8 @@ int FetchTheTime(struct tm* tinfo, time_t* timeVal);
 
 //----------------------------------------------------------------------------------------------------------------------------
 int  SETUP_VERSION  =      10001;
-char p_SSID[32] =          "NETGEAR90";
-char p_PWD[32] =           "elegantraven451";
+char p_SSID[32] =          "ssid";
+char p_PWD[32] =           "password";
 int DST_offset =           -1;
 int ST_GMT_offset =        -7;
 int ENABLE_AUTO_TIME_SET = 0;                   //0=Disable, 1=At reset only, 2=Continuous
