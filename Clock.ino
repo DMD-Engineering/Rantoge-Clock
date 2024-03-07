@@ -21,7 +21,7 @@ int loadCalibration();
 int FetchTheTime(struct tm* tinfo, time_t* timeVal);
 
 //----------------------------------------------------------------------------------------------------------------------------
-int  SETUP_VERSION  =      10002;
+int  SETUP_VERSION  =      10001;
 char p_SSID[32] =          "NETGEAR90";
 char p_PWD[32] =           "elegantraven451";
 int DST_offset =           -1;
@@ -34,6 +34,7 @@ char subnet[32] =        "255.255.0.0";
 char dns[32] =           "192.168.1.1";
 char hostName[32] =      "NodeClock";
 char dnsName[32] =       "clock";               //Access server at: dnsName.local
+char setTimeZone[32] =   "PST+8PDT,M3.2.0/2,M11.1.0/2"; //Refer to: https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
 
 //----------------------------------------------------------------------------------------------------------------------------
 
@@ -298,6 +299,7 @@ int SaveSetup(void)
     fp.print(F("dns=")); fp.println(dns);
     fp.print(F("hostName=")); fp.println(hostName);
     fp.print(F("dnsName=")); fp.println(dnsName);
+    fp.print(F("setTimeZone=")); fp.println(setTimeZone);
     fp.close();
   }
   Serial.printf("SaveSetup=%d\n",stat);
@@ -352,6 +354,9 @@ int RecallSetup(void)
       fp.readStringUntil('=');
       fp.readStringUntil('\n').toCharArray(dnsName,32);
       dnsName[strlen(dnsName)-1] = 0;
+      fp.readStringUntil('=');
+      fp.readStringUntil('\n').toCharArray(setTimeZone,32);
+      setTimeZone[strlen(setTimeZone)-1] = 0;
     }
     fp.close();
   }
@@ -451,9 +456,16 @@ void setup(){
   InitializeServer();
 
   //--- Initialize time/RTC ---
+#ifdef ESP32
+  configTime(0, 0, "pool.ntp.org");
+  setenv("TZ", setTimeZone, 1); //Refer to: https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
+  tzset();
+#else
   tzone.tz_dsttime = DST_offset * 3600;
   tzone.tz_minuteswest = ST_GMT_offset * 3600;
   configTime(ST_GMT_offset * 3600, DST_offset * 3600, ntpServer);
+#endif
+  
   if (FetchTheTime(&timeinfo, &globalRawTime) == 0)
   {
     Serial.println(F("Failed to obtain time"));
@@ -617,6 +629,53 @@ void AdvanceHourAndMinute()
   numMin -= correctMin;
   correctMin = 0;
 
+#if 0
+// ADD RST~ CONTROL (AND MODE 0?) TO DRV8825 AND USE 1/2 STEP MODE TO KEEP ONLY ONE MOTOR ACTIVE (QUICK SKIP one 1/2 step)
+//  digitalWrite(GPIO_EN2, LOW);
+//  delay(5);
+//  digitalWrite(GPIO_EN1, LOW);
+  for (x=0; x<numMin; x++)
+  {
+    if ((int)((double)x * d) == hrCnts)
+    {
+      for (y=0; y<stepRes; y++)
+      {
+        
+        digitalWrite(GPIO_ST1, HIGH);
+        delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)/stepRes));
+        digitalWrite(GPIO_ST2, HIGH);
+        delayMicroseconds((stepRate - (int)(((double)stepRate/2.0) + 0.5))/stepRes);
+        digitalWrite(GPIO_ST1, LOW);
+        delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)/stepRes));
+        digitalWrite(GPIO_ST2, LOW);
+        delayMicroseconds((stepRate - (int)(((double)stepRate/2.0) + 0.5))/stepRes);
+        yield();
+      }
+      hrCnts++;
+
+      OnStepHr(hrCnts);
+    }
+    else
+    {
+      digitalWrite(GPIO_EN1, LOW);
+      for (y=0; y<stepRes; y++)
+      {
+        digitalWrite(GPIO_ST1, HIGH);
+        delayMicroseconds(stepRate/stepRes);
+        digitalWrite(GPIO_ST1, LOW);
+        delayMicroseconds(stepRate/stepRes);
+        yield();
+      }
+      digitalWrite(GPIO_EN1, HIGH);
+    }
+
+    OnStepMin(x);
+    percentDone = (100 * x) / numMin;
+  }
+//  digitalWrite(GPIO_EN2, HIGH);
+//  digitalWrite(GPIO_EN1, HIGH);
+  percentDone = 100;
+#else
   digitalWrite(GPIO_EN2, LOW);
   delay(5);
   digitalWrite(GPIO_EN1, LOW);
@@ -658,6 +717,7 @@ void AdvanceHourAndMinute()
   digitalWrite(GPIO_EN2, HIGH);
   digitalWrite(GPIO_EN1, HIGH);
   percentDone = 100;
+#endif
 }
 
 //--------------------------------------------------------------------------------------------
@@ -1147,6 +1207,12 @@ void ProcessSerialCommand(String commandStr)
     String clockTime = getValue(commandStr, ' ', 1);
     String nowTime = getValue(commandStr, ' ', 2);
     syncTime(clockTime, nowTime);
+  }
+  if (cmdStr == "hm") 
+  {
+      Serial.printf("Advance Hour & minute... ");
+      AdvanceHourAndMinute();
+      Serial.printf("Done.\n");
   }
   if (cmdStr == "h") 
   {
