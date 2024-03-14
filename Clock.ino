@@ -16,7 +16,7 @@
 #include "sys/time.h"
 
 //----------------------------------------------------------------------------------------------------------------------------
-void getClockTime(int *hour, int *minute, float *herror, float *m10error, float *m1error, int enablePrint);
+void getClockTime(int *hour, int *minute, float *herror, float *m10error, float *m1error, float *minute10Angle, float *floatH, float *floatM1, int enablePrint);
 int loadCalibration();
 int FetchTheTime(struct tm* tinfo, time_t* timeVal);
 
@@ -62,6 +62,10 @@ int stepsMin = 0;
 int stepsHr = 0;
 
 int nextMinute = -1;
+int lastMinute10 = -1;
+int lastComputedClockH = 0;
+float lastComputedClockM = 0;
+int lastComputedClockS = 0;
 
 float angleMin10[120];
 float angleMin[120];
@@ -78,12 +82,18 @@ AS5600 as5600_1(&Wire);
 
 int NTPsyncAtLeastOnce = 0;
 int clockEnabled = 1;
+int disableCalibration = 0;
 
 volatile int prevHr;
 volatile int prevMin;
-volatile int percentDone = 100;
+volatile int percentDoneMin = 100;
+volatile int percentDoneHour = 100;
+volatile int percentDoneHrAndMin = 100;
 volatile int serverCommand = 1;
 char serverCommandStr[64];
+
+unsigned long time_stamp = 0;
+int Dprint = 0;
 
 AsyncWebServer server(80);
 
@@ -94,6 +104,8 @@ AsyncWebServer server(80);
 //numMinStepsNom: 1179.72 --> (1179.72 - 1180) * 25 = -7 --> 403.2 counts/day error = 0.342 digits/day error
 //numHrStepsNom:  491.55  --> (491.55 - 492) * 20 = -9 --> 10.8 counts/day error = 75.6 counts/wk error = 302.4 counts/mo error = 0.615 digits/mo error
 
+#define MotorStepAngle           (360.0/11800.0)
+
 #define numHrSteps               491.52
 #define numHrStepsNom            492
 #define numHrAdvCorrectCycles    20  
@@ -102,10 +114,9 @@ AsyncWebServer server(80);
 #define numMinSteps              1179.648
 #define numMinStepsNom           1180
 #define numMinAdvCorrectCycles   25  
-#define numMinStepsCorrectSteps  -7 
+#define numMinStepsCorrectSteps  -7
 
-int stepRate = 4000; //microseconds (us)
-int stepRes = 1;     //microstep = 1/stepRes
+int stepRate = 8000; //microseconds (us)
 
 const char* PARAM_INPUT_1 = "input1";
 String serverStatusDisplay = String("Command status: READY");
@@ -199,33 +210,20 @@ void InitializeServer()
     char str[12];
     sprintf(str,"%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
     datStr += String("<br>Current Time: ") + String(str);
-    int h, m;
-    float eh, em10, em1;
-    getClockTime(&h, &m, &eh, &em10, &em1, 0);
-    if (percentDone < 100)
+    if (percentDoneMin < 100)
     {
-      int sec = (59 * percentDone) / 100;
-      if (sec > 59) sec = 59;
-      if (percentDone < 25)
-      {
-        prevHr = h;
-        prevMin = m;
-      }
-      else
-      {
-        h = prevHr;
-        m = prevMin;
-      }
-      sprintf(str,"%02d:%02d:%02d", h, m, (59 * percentDone) / 100);
+      sprintf(str,"%02d:%02d:%02d", lastComputedClockH, (int)lastComputedClockM, lastComputedClockS);
     }
     else
     {
-      sprintf(str,"%02d:%02d", h, m);
+      sprintf(str,"%02d:%02d", lastComputedClockH, (int)lastComputedClockM);
     }
     datStr += String("<br>Clock Time: ") + String(str);
-    datStr += String("<br>H offset = ") + (int)((eh/360.0)*numHrStepsNom*24.0) + 
-      String("<br>M10 offset = ") + (int)((em10/360.0)*numMinStepsNom*10.0) + 
-      String("<br>M1 offset = ") + (int)((em1/360.0)*numMinStepsNom*10.0);
+//      datStr += String("<br>H offset = ") + (int)((eh/360.0)*numHrStepsNom*24.0) + 
+//      String("<br>M10 offset = ") + (int)((em10/360.0)*numMinStepsNom*10.0) + 
+//      String("<br>M1 offset = ") + (int)((em1/360.0)*numMinStepsNom*10.0);
+      String("<br>ClockM = ") + lastComputedClockM;
+      String("<br>ClockS = ") + lastComputedClockS;
     datStr += String("<br>");
     if (clockEnabled == 1) datStr += "Clock status: RUNNING<br>";
     else datStr += "Clock status: DISABLED<br>";
@@ -451,6 +449,8 @@ void setup(){
   IsCalibrated = loadCalibration();
   Serial.printf("Calibration status = %d\n", IsCalibrated);
 
+  InitialMinuteSense();
+
   InitializeWiFi();
 
   InitializeServer();
@@ -533,6 +533,57 @@ void OnStepHr(int x)
 }
 
 //--------------------------------------------------------------------------------------------
+void GoToHour(float targetHour)
+{
+  int x, y;
+  int h, m;
+  float eh, em10, em1, m10a, fH, fM1;
+
+  getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+  float startTime = fH;
+  float deltaTime = targetHour - startTime;
+  if (deltaTime < 0) deltaTime += 24.0;
+  float previous_toGo = deltaTime;
+
+  percentDoneHour = 0;
+
+  float hrDigitsToAdvance = targetHour - fH;
+  if (hrDigitsToAdvance < 0) hrDigitsToAdvance += 24.0;
+  float steps2Target = hrDigitsToAdvance * (float)numHrStepsNom;
+  int maxSteps = steps2Target + (2 * numHrStepsNom);
+
+  digitalWrite(GPIO_EN2, LOW);
+  time_stamp = micros();
+  for (x=0; x<maxSteps; x++)
+  {
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST2, HIGH);
+    digitalWrite(GPIO_ST2, LOW);
+    time_stamp = micros();
+    yield();
+
+    OnStepHr(x);
+
+    getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+    float nowTime = fH;
+    float doneTime = nowTime - startTime;
+    if (doneTime < 0) doneTime += 24.0;
+    percentDoneHour = (100.0 * doneTime) / deltaTime;
+
+    float toGo = targetHour - nowTime;
+    if (toGo < 0) toGo += 24;
+ 
+    if (Dprint) Serial.printf("h=%d lastComputedClockH=%0.2f toGo=%0.2f fH=%0.2f nowTime=%0.2f doneTime=%0.2f targetHour=%0.2f stepsHr=%d\n",
+      h,lastComputedClockH,toGo,fH,nowTime,doneTime,targetHour,stepsHr);
+
+    if ((toGo <= 0) || (abs(previous_toGo - toGo) > 12.0)) break;
+    previous_toGo = toGo;
+  }
+  digitalWrite(GPIO_EN2, HIGH);
+  percentDoneHour = 100;
+}
+
+//--------------------------------------------------------------------------------------------
 void AdvanceHour()
 {
   int numHr = numHrStepsNom;
@@ -547,16 +598,14 @@ void AdvanceHour()
   correctHr = 0;
   
   digitalWrite(GPIO_EN2, LOW);
+  time_stamp = micros();
   for (x=0; x<numHr; x++)
   {
-    for (y=0; y<stepRes; y++)
-    {
-      digitalWrite(GPIO_ST2, HIGH);
-      delayMicroseconds(stepRate/stepRes);
-      digitalWrite(GPIO_ST2, LOW);
-      delayMicroseconds(stepRate/stepRes);
-      yield();
-    }
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST2, HIGH);
+    digitalWrite(GPIO_ST2, LOW);
+    time_stamp = micros();
+    yield();
 
     OnStepHr(x);
   }
@@ -570,37 +619,171 @@ void OnStepMin(int x)
 }
 
 //--------------------------------------------------------------------------------------------
+void InitialMinuteSense()
+{
+  int x, y;
+  int h, m;
+  float eh, em10, em1, m10a, fH, fM1;
+
+  getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+  Serial.printf("InitialMinuteSense: fM1=%0.2f\n", fM1);
+  if (fM1 >= 9.05)
+  {
+    int maxSteps = 2 * numMinStepsNom;
+
+    digitalWrite(GPIO_EN1, LOW);
+    time_stamp = micros();
+    for (x=0; x<maxSteps; x++)
+    {
+      while (micros() - time_stamp < stepRate) ;
+      digitalWrite(GPIO_ST1, HIGH);
+      digitalWrite(GPIO_ST1, LOW);
+      time_stamp = micros();
+      yield();
+
+      getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+      if (fM1 < 0) fM1 += 10.0;
+      float frac = fM1 - (int)fM1;
+      if (frac >= 0.9) break;
+    }
+    digitalWrite(GPIO_EN1, HIGH);
+
+    Serial.printf("InitialMinuteSense: %0.2f lastMinute10=%d\n", fM1, lastMinute10);
+    lastMinute10 = m / 10;
+  }
+}
+
+//--------------------------------------------------------------------------------------------
+void GoToMinute(float targetMinute)
+{
+  int x, y;
+  int h, m;
+  float eh, em10, em1, m10a, fH, fM1;
+
+  getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+  float startTime = lastComputedClockM;
+  float deltaTime = targetMinute - startTime;
+  if (deltaTime < 0) deltaTime += 60.0;
+  float previous_toGo = deltaTime;
+
+  percentDoneMin = 0;
+
+  float minDigitsToAdvance = targetMinute - fM1;
+  if (minDigitsToAdvance < 0) minDigitsToAdvance += 60.0;
+  int steps2Target = minDigitsToAdvance * (float)numMinStepsNom;
+  int maxSteps = steps2Target + (2 * numMinStepsNom);
+
+  digitalWrite(GPIO_EN1, LOW);
+  time_stamp = micros();
+  for (x=0; x<maxSteps; x++)
+  {
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST1, HIGH);
+    digitalWrite(GPIO_ST1, LOW);
+    time_stamp = micros();
+    yield();
+
+    OnStepMin(x);
+
+    getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+    float nowTime = lastComputedClockM;
+    float doneTime = nowTime - startTime;
+    if (doneTime < 0) doneTime += 60.0;
+    percentDoneMin = (100.0 * doneTime) / deltaTime;
+
+    float toGo = targetMinute - nowTime;
+    if (toGo < 0) toGo += 60;
+
+    if (Dprint) Serial.printf("m=%d lastComputedClockM=%0.2f toGo=%0.2f fM1=%0.2f nowTime=%0.2f doneTime=%0.2f targetMinute=%0.2f stepsMin=%d\n",
+      m,lastComputedClockM,toGo,fM1,nowTime,doneTime,targetMinute,stepsMin);
+
+    if ((toGo <= 0) || (abs(previous_toGo - toGo) > 30.0)) break;
+    previous_toGo = toGo;
+  }
+  digitalWrite(GPIO_EN1, HIGH);
+  percentDoneMin = 100;
+}
+
+//--------------------------------------------------------------------------------------------
 void AdvanceMinute()
 {
   int numMin = numMinStepsNom;
   int x, y;
+
   if (minCount++ == numMinAdvCorrectCycles)
   {
     numMin = numMinStepsNom + numMinStepsCorrectSteps;
     minCount = 0;
   }
 
-  percentDone = 0;
+  percentDoneMin = 0;
   numMin -= correctMin;
   correctMin = 0;
 
   digitalWrite(GPIO_EN1, LOW);
+  time_stamp = micros();
   for (x=0; x<numMin; x++)
   {
-    for (y=0; y<stepRes; y++)
-    {
-      digitalWrite(GPIO_ST1, HIGH);
-      delayMicroseconds(stepRate/stepRes);
-      digitalWrite(GPIO_ST1, LOW);
-      delayMicroseconds(stepRate/stepRes);
-      yield();
-    }
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST1, HIGH);
+    digitalWrite(GPIO_ST1, LOW);
+    time_stamp = micros();
+    yield();
 
     OnStepMin(x);
-    percentDone = (100 * x) / numMin;
+    percentDoneMin = (100 * x) / numMin; //TODO: Verify % done for no sensors present
   }
   digitalWrite(GPIO_EN1, HIGH);
-  percentDone = 100;
+  percentDoneMin = 100;
+}
+
+//--------------------------------------------------------------------------------------------
+void GoToNextHourAndMinute(int targetHour, int targetMinute)
+{
+  int x, y;
+  int h, m;
+  float eh, em10, em1, m10a, fH, fM1;
+
+//TODO: None of this function is complete yet
+
+  percentDoneHrAndMin = 0;
+
+  getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+  float startTimeM = (float)m + ((em1/360.0)*10.0);
+  float deltaTimeM = (float)targetMinute - startTimeM;
+  if (deltaTimeM < 0) deltaTimeM += 60.0;
+//@@@@  lastComputedClockH = *hour;
+//@@@@  lastComputedClockM = (float)(10 * (*minute/10)) + fm1;
+//@@@@  lastComputedClockS = (int)((fm1 - (float)lastComputedClockM) * 60);
+ 
+  int minDigitsToAdvance = targetMinute - m;
+  if (minDigitsToAdvance < 0) minDigitsToAdvance += 60;
+  int steps2Target = (minDigitsToAdvance * numMinStepsNom) - (int)((em1/360.0)*numMinStepsNom*10.0);
+  int maxSteps = steps2Target + (2 * numMinStepsNom);
+
+  digitalWrite(GPIO_EN1, LOW);
+  time_stamp = micros();
+  for (x=0; x<maxSteps; x++)
+  {
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST1, HIGH);
+    digitalWrite(GPIO_ST1, LOW);
+    time_stamp = micros();
+    yield();
+
+    OnStepMin(x);
+
+    getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 0);
+    if ((m == targetMinute) && (em1 >= 0))
+      break;
+
+    float nowTime = (float)m + ((em1/360.0)*10.0);
+    float doneTime = nowTime - startTimeM;
+    if (doneTime < 0) doneTime += 60.0;
+    percentDoneHrAndMin = (100.0 * doneTime) / deltaTimeM;
+  }
+  digitalWrite(GPIO_EN1, HIGH);
+  percentDoneHrAndMin = 100;
 }
 
 //--------------------------------------------------------------------------------------------
@@ -623,110 +806,73 @@ void AdvanceHourAndMinute()
   }
   double d = (double)numHr / (double)numMin;
 
-  percentDone = 0;
+  percentDoneMin = 0;
   numHr -= correctHr;
   correctHr = 0;
   numMin -= correctMin;
   correctMin = 0;
 
-#if 0
-// ADD RST~ CONTROL (AND MODE 0?) TO DRV8825 AND USE 1/2 STEP MODE TO KEEP ONLY ONE MOTOR ACTIVE (QUICK SKIP one 1/2 step)
-//  digitalWrite(GPIO_EN2, LOW);
-//  delay(5);
-//  digitalWrite(GPIO_EN1, LOW);
-  for (x=0; x<numMin; x++)
-  {
-    if ((int)((double)x * d) == hrCnts)
-    {
-      for (y=0; y<stepRes; y++)
-      {
-        
-        digitalWrite(GPIO_ST1, HIGH);
-        delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)/stepRes));
-        digitalWrite(GPIO_ST2, HIGH);
-        delayMicroseconds((stepRate - (int)(((double)stepRate/2.0) + 0.5))/stepRes);
-        digitalWrite(GPIO_ST1, LOW);
-        delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)/stepRes));
-        digitalWrite(GPIO_ST2, LOW);
-        delayMicroseconds((stepRate - (int)(((double)stepRate/2.0) + 0.5))/stepRes);
-        yield();
-      }
-      hrCnts++;
-
-      OnStepHr(hrCnts);
-    }
-    else
-    {
-      digitalWrite(GPIO_EN1, LOW);
-      for (y=0; y<stepRes; y++)
-      {
-        digitalWrite(GPIO_ST1, HIGH);
-        delayMicroseconds(stepRate/stepRes);
-        digitalWrite(GPIO_ST1, LOW);
-        delayMicroseconds(stepRate/stepRes);
-        yield();
-      }
-      digitalWrite(GPIO_EN1, HIGH);
-    }
-
-    OnStepMin(x);
-    percentDone = (100 * x) / numMin;
-  }
-//  digitalWrite(GPIO_EN2, HIGH);
-//  digitalWrite(GPIO_EN1, HIGH);
-  percentDone = 100;
-#else
   digitalWrite(GPIO_EN2, LOW);
   delay(5);
   digitalWrite(GPIO_EN1, LOW);
+  time_stamp = micros();
   for (x=0; x<numMin; x++)
   {
+    while (micros() - time_stamp < stepRate) ;
     if ((int)((double)x * d) == hrCnts)
     {
-      for (y=0; y<stepRes; y++)
-      {
-        digitalWrite(GPIO_ST1, HIGH);
-        delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)/stepRes));
-        digitalWrite(GPIO_ST2, HIGH);
-        delayMicroseconds((stepRate - (int)(((double)stepRate/2.0) + 0.5))/stepRes);
-        digitalWrite(GPIO_ST1, LOW);
-        delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)/stepRes));
-        digitalWrite(GPIO_ST2, LOW);
-        delayMicroseconds((stepRate - (int)(((double)stepRate/2.0) + 0.5))/stepRes);
-        yield();
-      }
+      digitalWrite(GPIO_ST1, HIGH);
+      digitalWrite(GPIO_ST1, LOW);
+      time_stamp = micros();
+      delayMicroseconds((int)((((double)stepRate/2.0) + 0.5)));
+      digitalWrite(GPIO_ST2, HIGH);
+      digitalWrite(GPIO_ST2, LOW);
+
       hrCnts++;
 
       OnStepHr(hrCnts);
     }
     else
     {
-      for (y=0; y<stepRes; y++)
-      {
-        digitalWrite(GPIO_ST1, HIGH);
-        delayMicroseconds(stepRate/stepRes);
-        digitalWrite(GPIO_ST1, LOW);
-        delayMicroseconds(stepRate/stepRes);
-        yield();
-      }
+      digitalWrite(GPIO_ST1, HIGH);
+      digitalWrite(GPIO_ST1, LOW);
+      time_stamp = micros();
     }
+    yield();
 
     OnStepMin(x);
-    percentDone = (100 * x) / numMin;
+    percentDoneMin = (100 * x) / numMin;   //TODO: Verify % done for no sensors present
   }
   digitalWrite(GPIO_EN2, HIGH);
   digitalWrite(GPIO_EN1, HIGH);
-  percentDone = 100;
-#endif
+  percentDoneMin = 100;
 }
 
 //--------------------------------------------------------------------------------------------
 float getAngle(int sensorNum, int printStatus)
 {
-  if (sensorNum == 1) Wire.begin(GPIO_SDA1, GPIO_SCL);
-  else if (sensorNum == 2) Wire.begin(GPIO_SDA2, GPIO_SCL);
-  else if (sensorNum == 3) Wire.begin(GPIO_SDA3, GPIO_SCL);
-  as5600_1.begin(GPIO_15);
+  float angle;
+  int retryCount = 3;
+
+  do
+  {
+    if (sensorNum == 1) Wire.begin(GPIO_SDA1, GPIO_SCL);
+    else if (sensorNum == 2) Wire.begin(GPIO_SDA2, GPIO_SCL);
+    else if (sensorNum == 3) Wire.begin(GPIO_SDA3, GPIO_SCL);
+    Wire.setClock(100000);
+    as5600_1.begin(GPIO_15);
+    angle = as5600_1.readAngle() * AS5600_RAW_TO_DEGREES;
+    if (as5600_1._error == AS5600_OK) break;
+    else
+    {
+      #if 0 //ONLY FOR TESTING
+      Serial.printf("\nBAD ANGLE READ: RetryCount:%d Sensor:%d Connected:%d Error:%d Angle:%0.2f\n", retryCount, sensorNum, as5600_1.isConnected(), as5600_1._error, angle);
+      #endif
+      if (retryCount == 1) Serial.printf("\nBAD ANGLE READ\n");
+      Wire.end();
+    }
+  } while (--retryCount > 0);
+  
   if (printStatus == 1)
   {
     int stat = as5600_1.readStatus();
@@ -737,7 +883,6 @@ float getAngle(int sensorNum, int printStatus)
     else msg += "OK";
     Serial.printf("%d --> Magnet %s >> Angle: %0.2f\n", sensorNum, msg.c_str(), as5600_1.readAngle() * AS5600_RAW_TO_DEGREES);
   }
-  float angle = as5600_1.readAngle() * AS5600_RAW_TO_DEGREES;
 #ifdef ESP32
   Wire.end();
 #endif
@@ -884,7 +1029,8 @@ int loadCalibration()
 }
 
 //--------------------------------------------------------------------------------------------
-void getClockTime(int *hour, int *minute, float *herror, float *m10error, float *m1error, int enablePrint)
+void getClockTime(int *hour, int *minute, float *herror, float *m10error, float *m1error,
+  float *minute10Angle, float *floatH, float *floatM1, int enablePrint)
 {
   float h = getAngle(1, 0);
   float m10 = getAngle(2, 0);
@@ -895,11 +1041,9 @@ void getClockTime(int *hour, int *minute, float *herror, float *m10error, float 
   int minute10 = 0;
   float mdiff;
 
-  if (IsCalibrated == 0)
-  {
-    *herror = 0;
-    *m10error = 0;
-    *m1error = 0;
+  if ((IsCalibrated == 0) && (disableCalibration == 0))
+  { 
+    //TODO: Return internally tracked time?
     return;
   }
 
@@ -917,6 +1061,42 @@ void getClockTime(int *hour, int *minute, float *herror, float *m10error, float 
   }
   if (herror != NULL) *herror = mdiff;
 
+  //.............................................
+  float frac;
+  float num, den;
+  int idx;
+  float delt = h - hourCalibration[*hour];
+  if (delt > 180) delt -=360;
+  else if (delt < -180) delt += 360;
+  if (delt < 0)
+  {
+    idx = *hour - 1;
+    if (idx < 0) idx += 24;
+    num = (hourCalibration[*hour] - h);
+    if (num > 180) num -=360;
+    else if (num < -180) num += 360;
+    den = hourCalibration[idx] - hourCalibration[*hour];
+    if (den > 180) den -=360;
+    else if (den < -180) den += 360;
+    frac = -abs(num / den);
+  }
+  else
+  {
+    idx = *hour + 1;
+    if (idx >= 24) idx -= 24;
+    num = (hourCalibration[*hour] - h);
+    if (num > 180) num -=360;
+    else if (num < -180) num += 360;
+    den = hourCalibration[idx] - hourCalibration[*hour];
+    if (den > 180) den -=360;
+    else if (den < -180) den += 360;
+    frac = abs(num / den);
+  }
+  float fh = (float)*hour + frac;
+  if (floatH != NULL) *floatH = fh;
+  if (enablePrint == 1) Serial.printf("floatH=%0.2f h=%0.2f *hour=%d idx=%d\n", fh, h, *hour, idx);
+  //.............................................
+  
   mdiff = 99999;
   for (i=0; i<10; i++)
   {
@@ -931,6 +1111,40 @@ void getClockTime(int *hour, int *minute, float *herror, float *m10error, float 
   }
   if (m1error != NULL) *m1error = mdiff;
 
+  //.............................................
+  delt = m1 - min1Calibration[minute1];
+  if (delt > 180) delt -=360;
+  else if (delt < -180) delt += 360;
+  if (delt < 0)
+  {
+    idx = minute1 - 1;
+    if (idx < 0) idx += 10;
+    num = (min1Calibration[minute1] - m1);
+    if (num > 180) num -=360;
+    else if (num < -180) num += 360;
+    den = min1Calibration[idx] - min1Calibration[minute1];
+    if (den > 180) den -=360;
+    else if (den < -180) den += 360;
+    frac = -abs(num / den);
+  }
+  else
+  {
+    idx = minute1 + 1;
+    if (idx >= 10) idx -= 10;
+    num = (min1Calibration[minute1] - m1);
+    if (num > 180) num -=360;
+    else if (num < -180) num += 360;
+    den = min1Calibration[idx] - min1Calibration[minute1];
+    if (den > 180) den -=360;
+    else if (den < -180) den += 360;
+    frac = abs(num / den);
+  }
+  float fm1 = (float)minute1 + frac;
+  if (floatM1 != NULL) *floatM1 = fm1;
+  if (enablePrint == 1) Serial.printf("floatM1=%0.2f m1=%0.2f minute1=%d idx=%d\n",
+    fm1, m1, minute1, idx);
+  //.............................................
+
   mdiff = 99999;
   for (i=0; i<12; i++)
   {
@@ -940,20 +1154,35 @@ void getClockTime(int *hour, int *minute, float *herror, float *m10error, float 
     if (abs(diff) < abs(mdiff))
     {
       mdiff = diff;
+      if (minute10Angle != NULL) *minute10Angle = min10Calibration[i];
       minute10 = i%6;
     }
   }
   if (m10error != NULL) *m10error = mdiff;
-  
+
+  if (Dprint) Serial.printf("...minute10=%d lastMinute10=%d fm1=%0.2f\n",minute10,lastMinute10,fm1);
+  if ((fm1 > 9.0) && (lastMinute10 >= 0)) //Handle [n]9-->[n+1]0 minute switch over
+  {
+    minute10 = lastMinute10;
+  }
+  lastMinute10 = minute10;
+
   *minute = (10*minute10) + minute1;
 
+  lastComputedClockH = *hour;
+  lastComputedClockM = (float)(10 * (*minute/10)) + fm1;
+  if (lastComputedClockM < 0) lastComputedClockM += 60.0;
+  lastComputedClockS = (int)(lastComputedClockM * 60.0) % 60;
+  if (lastComputedClockS > 60) lastComputedClockS -= 60;
+  
   if (enablePrint == 1)
   {
-    Serial.printf("Clock Time=%02d:%02d  ", *hour, *minute);
-    Serial.printf("Error-> h=%0.2f(%d) m10=%0.2f(%d) m1=%0.2f(%d)\n",
+    Serial.printf("Clock Time=%02d:%02d  ", *hour, (int)lastComputedClockM);
+    Serial.printf("Error-> h=%0.2f(%d) m10=%0.2f(%d) m1=%0.2f(%d) %d %0.2f %d\n",
       *herror, (int)((*herror/360.0)*numHrStepsNom*24.0), 
       *m10error, (int)((*m10error/360.0)*numMinStepsNom*10.0), 
-      *m1error, (int)((*m1error/360.0)*numMinStepsNom*10.0));
+      *m1error, (int)((*m1error/360.0)*numMinStepsNom*10.0),
+      lastComputedClockH, lastComputedClockM, lastComputedClockS);
   }
 }
 
@@ -961,11 +1190,12 @@ void getClockTime(int *hour, int *minute, float *herror, float *m10error, float 
 void fineSet(int show)
 {
   int h, m;
-  float eh, em10, em1;
-  getClockTime(&h, &m, &eh, &em10, &em1, 0);
+  float eh, em10, em1, m10a;
+  getClockTime(&h, &m, &eh, &em10, &em1, &m10a, NULL, NULL, 0);
   if (show == 1)
   {
-    Serial.printf("FineSet -> Clock Time=%02d:%02d  ", h, m);
+    //Serial.printf("FineSet -> Clock Time=%02d:%02d  ", h, m);
+    Serial.printf("FineSet -> Clock Time=%02d:%02d  ", h, (int)lastComputedClockM);
     Serial.printf("Errors: h=%0.2f(%d) m10=%0.2f(%d) m1=%0.2f(%d)\n",
       eh, (int)((eh/360.0)*numHrStepsNom*24.0), em10, (int)((em10/360.0)*numMinStepsNom*10.0), em1, (int)((em1/360.0)*numMinStepsNom*10.0));
   }
@@ -976,6 +1206,9 @@ void fineSet(int show)
 //--------------------------------------------------------------------------------------------
 int syncTime(String clockTime, String nowTime)
 {
+
+   //TODO: Test this for all cases
+   
   int clockHr;
   int clockMin;
   if ((clockTime != "") && (clockTime != "-1:-1"))
@@ -985,9 +1218,10 @@ int syncTime(String clockTime, String nowTime)
   }
   else
   {
-    if (IsCalibrated == 1)
+    if ((IsCalibrated == 1) && (disableCalibration == 0))
     {
-      getClockTime(&clockHr, &clockMin, NULL, NULL, NULL, 0);
+      float eh, em10, em1, m10a;
+      getClockTime(&clockHr, &clockMin, NULL, NULL, NULL, NULL, NULL, NULL, 0);
       if (clockTime == "-1:-1")
       {
         setNowTime(nowTime);
@@ -1011,36 +1245,43 @@ void MoveHour(int num)
   int x;
   int y;
   digitalWrite(GPIO_EN2, LOW);
+  time_stamp = micros();
   for (x=0; x<num; x++)
   {
-    for (y=0; y<stepRes; y++)
-    {
-      digitalWrite(GPIO_ST2, HIGH);
-      delayMicroseconds(stepRate/stepRes);
-      digitalWrite(GPIO_ST2, LOW);
-      delayMicroseconds(stepRate/stepRes);
-      yield();
-    }
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST2, HIGH);
+    digitalWrite(GPIO_ST2, LOW);
+    time_stamp = micros();
+    yield();
     OnStepHr(x);
   }
   digitalWrite(GPIO_EN2, HIGH);
 }
 
 //--------------------------------------------------------------------------------------------
-void calibrateHour(int clockHr)
+void calibrateHour(int clockHr, int digitOnly)
 {
   int i;
-  Serial.printf("Hour Cal:\n");
-  for (i=0; i<24; i++)
+
+  if (digitOnly == 1)
   {
-    Serial.printf(".");
-    AdvanceHour();
-    delay(100);
-    clockHr++;
-    if (clockHr >= 24) clockHr -= 24;
     hourCalibration[clockHr] = getAngle(1, 0);
   }
-  Serial.printf("\nDone.\n");
+  else
+  {
+    Serial.printf("Hour Cal:\n");
+    for (i=0; i<24; i++)
+    {
+      Serial.printf(".");
+      AdvanceHour();
+      delay(500);
+      clockHr++;
+      if (clockHr >= 24) clockHr -= 24;
+      hourCalibration[clockHr] = getAngle(1, 0);
+    }
+    Serial.printf("\nDone.\n");
+  }
+  
   File fp = SPIFFS.open("/hcal.txt", "w");
   if (fp)
   {
@@ -1051,35 +1292,43 @@ void calibrateHour(int clockHr)
 }
 
 //--------------------------------------------------------------------------------------------
-void calibrateMinute(int clockMin, int heatDelay)
+void calibrateMinute(int clockMin, int digitOnly)
 {
   File fp;
   int i, j;
 
-  Serial.printf("Minute Cal:\n");
-  for (i=0; i<60; i++)
+  if (digitOnly == 1)
   {
-    Serial.printf(".");
-    AdvanceMinute();
-    delay(heatDelay);
-    clockMin++;
-    if (clockMin >= 120) clockMin -= 120;
     angleMin10[clockMin] = getAngle(2, 0);
     angleMin[clockMin] = getAngle(3, 0);
   }
-  Serial.printf("\n");
-  for (i=60; i<120; i++)
+  else
   {
-    Serial.printf("+");
-    AdvanceMinute();
-    delay(heatDelay);
-    clockMin++;
-    if (clockMin >= 120) clockMin -= 120;
-    angleMin10[clockMin] = getAngle(2, 0);
-    angleMin[clockMin] = getAngle(3, 0);
+    Serial.printf("Minute Cal:\n");
+    for (i=0; i<60; i++)
+    {
+      Serial.printf(".");
+      AdvanceMinute();
+      delay(250);
+      clockMin++;
+      if (clockMin >= 120) clockMin -= 120;
+      angleMin10[clockMin] = getAngle(2, 0);
+      angleMin[clockMin] = getAngle(3, 0);
+    }
+    Serial.printf("\n");
+    for (i=60; i<120; i++)
+    {
+      Serial.printf("+");
+      AdvanceMinute();
+      delay(250);
+      clockMin++;
+      if (clockMin >= 120) clockMin -= 120;
+      angleMin10[clockMin] = getAngle(2, 0);
+      angleMin[clockMin] = getAngle(3, 0);
+    }
+    Serial.printf("\nDone.\n");
   }
-  Serial.printf("\nDone.\n");
-
+  
   for (j=0; j<10; j++) min1Calibration[j] = 0;
   float wrapCorrect = 0;
   
@@ -1143,16 +1392,15 @@ void MoveMinute(int num)
   int x;
   int y;
   digitalWrite(GPIO_EN1, LOW);
+  time_stamp = micros();
   for (x=0; x<num; x++)
   {
-    for (y=0; y<stepRes; y++)
-    {
-      digitalWrite(GPIO_ST1, HIGH);
-      delayMicroseconds(stepRate/stepRes);
-      digitalWrite(GPIO_ST1, LOW);
-      delayMicroseconds(stepRate/stepRes);
-      yield();
-    }
+    while (micros() - time_stamp < stepRate) ;
+    digitalWrite(GPIO_ST1, HIGH);
+    digitalWrite(GPIO_ST1, LOW);
+    time_stamp = micros();
+    yield();
+      
     OnStepMin(x);
   }
   digitalWrite(GPIO_EN1, HIGH);
@@ -1162,6 +1410,15 @@ void MoveMinute(int num)
 void ProcessSerialCommand(String commandStr)
 {
   String cmdStr = getValue(commandStr,' ',0);
+
+  if (cmdStr == "disablecal") 
+  {
+    disableCalibration = getValue(commandStr, ' ', 1).toInt();
+  }
+  if (cmdStr == "dprint") 
+  {
+    Dprint = getValue(commandStr, ' ', 1).toInt();
+  }
   if (cmdStr == "enable") 
   {
     clockEnabled = getValue(commandStr, ' ', 1).toInt();
@@ -1173,8 +1430,8 @@ void ProcessSerialCommand(String commandStr)
   if (cmdStr == "clocktime") 
   {
     int h, m;
-    float eh, em10, em1;
-    getClockTime(&h, &m, &eh, &em10, &em1, 1);
+    float eh, em10, em1, m10a, fH, fM1;
+    getClockTime(&h, &m, &eh, &em10, &em1, &m10a, &fH, &fM1, 1);
   }
   if (cmdStr == "angles") 
   {
@@ -1184,18 +1441,21 @@ void ProcessSerialCommand(String commandStr)
   {
     loadCalibration();
   }
-  if (cmdStr == "calh") 
+  if (cmdStr == "calh") //calh [currentClockHour] [1=SetForOnlyCurrentDigit]
   {
     int clockHr = getValue(commandStr, ' ', 1).toInt();
-    calibrateHour(clockHr);
+    int digitOnly = 0;
+    if (getValue(commandStr, ' ', 2) != "")
+      digitOnly = getValue(commandStr, ' ', 2).toInt();
+    calibrateHour(clockHr, digitOnly);
   }
-  if (cmdStr == "calm") 
+  if (cmdStr == "calm") //calm [currentClockHour] [1=SetForOnlyCurrentDigit]
   {
     int clockMin = getValue(commandStr, ' ', 1).toInt();
-    int heatDelay = 100;
-    String param = getValue(commandStr, ' ', 2);
-    if (param != "") heatDelay = getValue(commandStr, ' ', 2).toInt();
-    calibrateMinute(clockMin, heatDelay);
+    int digitOnly = 0;
+    if (getValue(commandStr, ' ', 2) != "")
+      digitOnly = getValue(commandStr, ' ', 2).toInt();
+    calibrateMinute(clockMin, digitOnly);
   }
   if (cmdStr == "time") 
   {
@@ -1214,6 +1474,10 @@ void ProcessSerialCommand(String commandStr)
       AdvanceHourAndMinute();
       Serial.printf("Done.\n");
   }
+  if (cmdStr == "gh") 
+  {
+    GoToHour(getValue(commandStr, ' ', 1).toFloat());
+  }
   if (cmdStr == "h") 
   {
     String param = getValue(commandStr, ' ', 1);
@@ -1230,6 +1494,10 @@ void ProcessSerialCommand(String commandStr)
       MoveHour(num);
       Serial.printf("Done.\n");
     }
+  }
+  if (cmdStr == "gm") 
+  {
+    GoToMinute(getValue(commandStr, ' ', 1).toFloat());
   }
   if (cmdStr == "m") 
   {
@@ -1251,7 +1519,6 @@ void ProcessSerialCommand(String commandStr)
   if (cmdStr == "setstep") 
   {
     stepRate = getValue(commandStr, ' ', 1).toInt();
-    stepRes = getValue(commandStr, ' ', 2).toInt();
   }
   if (cmdStr == "x") 
   {
@@ -1264,7 +1531,6 @@ void loop() {
   int stat;
 
   //--- Serial port command handling ---
-  //if (Serial.available() > 0)
   while (Serial.available() > 0)
   {
     incomingByte = Serial.read();
@@ -1284,6 +1550,8 @@ void loop() {
     serverStatusDisplay = String("Command status: Command Complete");
   }
 
+  //TODO: Don't advance minute more than 50 minutes, just wait for that time to elapse
+
   int timeStatus = FetchTheTime(&timeinfo, &globalRawTime);
   if (((timeinfo.tm_sec == 0) || (timeinfo.tm_min == nextMinute)) && (clockEnabled == 1))
   {
@@ -1291,27 +1559,43 @@ void loop() {
       timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     if (timeinfo.tm_min == 0)
     {
-      AdvanceHourAndMinute();
+      if ((IsCalibrated == 1) && (disableCalibration == 0))
+      {
+        GoToHour((float)timeinfo.tm_hour); 
+        GoToMinute((float)timeinfo.tm_min);
+        //GoToNextHourAndMinute((float)timeinfo.tm_hour, (foat)timeinfo.tm_min); //TODO
+      }
+      else
+      {
+        AdvanceHourAndMinute();
+      }
     }
     else
     {
-      AdvanceMinute();
+      if ((IsCalibrated == 1) && (disableCalibration == 0))
+      {
+        GoToMinute((float)timeinfo.tm_min);
+      }
+      else
+      {
+        AdvanceMinute();
+      }
     }
     nextMinute = timeinfo.tm_min + 1;
     if (nextMinute == 60) nextMinute = 0;
     
     int h, m;
-    float eh, em10, em1;
-    getClockTime(&h, &m, &eh, &em10, &em1, 0);
+    float eh, em10, em1, m10a;
+    getClockTime(&h, &m, &eh, &em10, &em1, &m10a, NULL, NULL, 0);
     Serial.printf("%d %d %0.2f(%d) %0.2f(%d) %0.2f(%d)", stepsHr, stepsMin,
       getAngle(1, 0), (int)((eh/360.0)*numHrStepsNom*24.0),
       getAngle(2, 0), (int)((em10/360.0)*numMinStepsNom*10.0),
       getAngle(3, 0), (int)((em1/360.0)*numMinStepsNom*10.0));
 
-    if (IsCalibrated == 1)
+    if ((IsCalibrated == 1) && (disableCalibration == 0)) //TODO: This section not needed because tile would be set above?
     {
       int clockHr, clockMin;
-      getClockTime(&clockHr, &clockMin, NULL, NULL, NULL, 0);
+      getClockTime(&clockHr, &clockMin, NULL, NULL, NULL, NULL, NULL, NULL, 0);
       if ((timeinfo.tm_min != clockMin) && (NTPsyncAtLeastOnce == 1))
       {
         Serial.printf(" - Time not set");
@@ -1319,8 +1603,9 @@ void loop() {
         {
           Serial.printf("\n");
           delay(5000);
-          setClockTime(clockHr, clockMin);
-          fineSet(0);
+          GoToHour((float)clockHr);
+          GoToMinute((float)clockMin);
+
           if (ENABLE_AUTO_TIME_SET == 1) ENABLE_AUTO_TIME_SET = 0;
         }
       }
