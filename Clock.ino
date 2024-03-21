@@ -1,3 +1,5 @@
+//BOARD: ESP32 Dev Module
+
 #ifdef ESP32
  #include <WiFi.h>
  #include <ESPmDNS.h>
@@ -21,20 +23,21 @@ int loadCalibration();
 int FetchTheTime(struct tm* tinfo, time_t* timeVal);
 
 //----------------------------------------------------------------------------------------------------------------------------
-int  SETUP_VERSION  =      10001;
+int  SETUP_VERSION  =      10002;
 char p_SSID[32] =          "ssid";
 char p_PWD[32] =           "password";
 int DST_offset =           -1;
 int ST_GMT_offset =        -7;
-int ENABLE_AUTO_TIME_SET = 0;                   //0=Disable, 1=At reset only, 2=Continuous
+int ENABLE_AUTO_TIME_SET = 0;                   //0=Disable, 1=Set time at reset
 //char staticIP[32] =      "192.168.1.167";
-char staticIP[32] =      "0";
-char gateway[32] =       "192.168.1.1";
-char subnet[32] =        "255.255.0.0";
-char dns[32] =           "192.168.1.1";
-char hostName[32] =      "NodeClock";
-char dnsName[32] =       "clock";               //Access server at: dnsName.local
-char setTimeZone[32] =   "PST+8PDT,M3.2.0/2,M11.1.0/2"; //Refer to: https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
+char staticIP[32] =        "0";
+char gateway[32] =         "192.168.1.1";
+char subnet[32] =          "255.255.0.0";
+char dns[32] =             "192.168.1.1";
+char hostName[32] =        "NodeClock";
+char dnsName[32] =         "clock";               //Access server at: dnsName.local
+char setTimeZone[32] =     "PST+8PDT,M3.2.0/2,M11.1.0/2"; //Refer to: https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
+int ENABLE_FORCE_12H =     0;
 
 //----------------------------------------------------------------------------------------------------------------------------
 
@@ -47,7 +50,7 @@ timezone tzone;
 time_t globalRawTime;
 struct tm timeinfo;
 time_t LastNTPtime = 0;
-char ntpServer[32] =     "pool.ntp.org";
+char ntpServer[32] = "pool.ntp.org";
 
 unsigned long delayStart = 0;
 
@@ -298,6 +301,7 @@ int SaveSetup(void)
     fp.print(F("hostName=")); fp.println(hostName);
     fp.print(F("dnsName=")); fp.println(dnsName);
     fp.print(F("setTimeZone=")); fp.println(setTimeZone);
+    fp.print(F("ENABLE_FORCE_12H=")); fp.println(ENABLE_FORCE_12H);
     fp.close();
   }
   Serial.printf("SaveSetup=%d\n",stat);
@@ -355,6 +359,8 @@ int RecallSetup(void)
       fp.readStringUntil('=');
       fp.readStringUntil('\n').toCharArray(setTimeZone,32);
       setTimeZone[strlen(setTimeZone)-1] = 0;
+      fp.readStringUntil('=');
+      ENABLE_FORCE_12H = fp.parseInt();
     }
     fp.close();
   }
@@ -449,7 +455,7 @@ void setup(){
   IsCalibrated = loadCalibration();
   Serial.printf("Calibration status = %d\n", IsCalibrated);
 
-  InitialMinuteSense();
+  ////InitialMinuteSense();
 
   InitializeWiFi();
 
@@ -544,6 +550,12 @@ void GoToHour(float targetHour)
   float deltaTime = targetHour - startTime;
   if (deltaTime < 0) deltaTime += 24.0;
   float previous_toGo = deltaTime;
+
+  if (deltaTime < 0.1)
+  {
+    Serial.printf("GoToHour: deltaTime < 0.1\n");
+    return;
+  }
 
   percentDoneHour = 0;
 
@@ -666,11 +678,18 @@ void GoToMinute(float targetMinute)
   if (deltaTime < 0) deltaTime += 60.0;
   float previous_toGo = deltaTime;
 
+  if (deltaTime < 0.25)
+  {
+    Serial.printf("GoToMinute: deltaTime < 0.1\n");
+    return;
+  }
+
   percentDoneMin = 0;
 
   float minDigitsToAdvance = targetMinute - fM1;
   if (minDigitsToAdvance < 0) minDigitsToAdvance += 60.0;
   int steps2Target = minDigitsToAdvance * (float)numMinStepsNom;
+//  int maxSteps = steps2Target + (2 * numMinStepsNom);
   int maxSteps = steps2Target + (2 * numMinStepsNom);
 
   digitalWrite(GPIO_EN1, LOW);
@@ -1292,15 +1311,46 @@ void calibrateHour(int clockHr, int digitOnly)
 }
 
 //--------------------------------------------------------------------------------------------
-void calibrateMinute(int clockMin, int digitOnly)
+void calibrateMinute(int clockMin, int digitOnly, int heatDelay)
 {
   File fp;
   int i, j;
 
   if (digitOnly == 1)
   {
-    angleMin10[clockMin] = getAngle(2, 0);
-    angleMin[clockMin] = getAngle(3, 0);
+    fp = SPIFFS.open("/mcal0.txt", "r");
+    if (fp)
+    {
+      int i, ival;
+      for (i=0; i<120; i++)
+      {
+        if (!fp.available()) break;
+        ival = fp.parseInt();
+        angleMin10[i] = fp.parseFloat();
+        angleMin[i] = fp.parseFloat();
+      }
+      if (fp.parseInt() != 1234)
+      {
+        Serial.printf("Calibration not valid.\n");
+        fp.close();
+        return;
+      }
+      fp.close();
+    }
+    else
+    {
+      Serial.printf("Calibration not valid.\n");
+      fp.close();
+      return;
+    }
+    
+    float aM10 = getAngle(2, 0);
+    float aM1Min = getAngle(3, 0);
+    for (i=clockMin; i<120; i+=10)
+    {
+      angleMin10[i] = aM10;
+      angleMin[i] = aM1Min;
+    }
   }
   else
   {
@@ -1309,7 +1359,8 @@ void calibrateMinute(int clockMin, int digitOnly)
     {
       Serial.printf(".");
       AdvanceMinute();
-      delay(250);
+      if ((heatDelay > 0) && ((i%15) == 0) && (i != 0)) delay(heatDelay);
+      else delay(500);
       clockMin++;
       if (clockMin >= 120) clockMin -= 120;
       angleMin10[clockMin] = getAngle(2, 0);
@@ -1320,7 +1371,8 @@ void calibrateMinute(int clockMin, int digitOnly)
     {
       Serial.printf("+");
       AdvanceMinute();
-      delay(250);
+      if ((heatDelay > 0) && ((i%15) == 0)) delay(heatDelay);
+      else delay(500);
       clockMin++;
       if (clockMin >= 120) clockMin -= 120;
       angleMin10[clockMin] = getAngle(2, 0);
@@ -1411,6 +1463,10 @@ void ProcessSerialCommand(String commandStr)
 {
   String cmdStr = getValue(commandStr,' ',0);
 
+  if (cmdStr == "force12h") 
+  {
+    ENABLE_FORCE_12H = getValue(commandStr, ' ', 1).toInt();
+  }
   if (cmdStr == "disablecal") 
   {
     disableCalibration = getValue(commandStr, ' ', 1).toInt();
@@ -1449,13 +1505,18 @@ void ProcessSerialCommand(String commandStr)
       digitOnly = getValue(commandStr, ' ', 2).toInt();
     calibrateHour(clockHr, digitOnly);
   }
-  if (cmdStr == "calm") //calm [currentClockHour] [1=SetForOnlyCurrentDigit]
+  if (cmdStr == "calm") //calm [currentClockMin] [1=SetForOnlyCurrentDigit]
   {
     int clockMin = getValue(commandStr, ' ', 1).toInt();
     int digitOnly = 0;
+    int heatDelay = 0;
     if (getValue(commandStr, ' ', 2) != "")
+    {
       digitOnly = getValue(commandStr, ' ', 2).toInt();
-    calibrateMinute(clockMin, digitOnly);
+      if (getValue(commandStr, ' ', 3) != "")
+        heatDelay = getValue(commandStr, ' ', 3).toInt();
+    }
+    calibrateMinute(clockMin, digitOnly, heatDelay);
   }
   if (cmdStr == "time") 
   {
@@ -1557,13 +1618,25 @@ void loop() {
   {
     Serial.printf("Time: %02d-%02d-%02d %02d:%02d:%02d - ",
       timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
     if (timeinfo.tm_min == 0)
     {
       if ((IsCalibrated == 1) && (disableCalibration == 0))
       {
-        GoToHour((float)timeinfo.tm_hour); 
-        GoToMinute((float)timeinfo.tm_min);
         //GoToNextHourAndMinute((float)timeinfo.tm_hour, (foat)timeinfo.tm_min); //TODO
+        if (ENABLE_FORCE_12H == 0)
+        {
+          GoToHour((float)timeinfo.tm_hour);
+        }
+        else
+        {
+          int hr = timeinfo.tm_hour;
+          if (hr == 0) hr = 12;
+          if (hr > 12) hr -= 12;
+          GoToHour((float)hr);
+        }
+        GoToMinute((float)timeinfo.tm_min);
+        ENABLE_AUTO_TIME_SET = 0;
       }
       else
       {
@@ -1592,25 +1665,78 @@ void loop() {
       getAngle(2, 0), (int)((em10/360.0)*numMinStepsNom*10.0),
       getAngle(3, 0), (int)((em1/360.0)*numMinStepsNom*10.0));
 
-    if ((IsCalibrated == 1) && (disableCalibration == 0)) //TODO: This section not needed because tile would be set above?
-    {
-      int clockHr, clockMin;
-      getClockTime(&clockHr, &clockMin, NULL, NULL, NULL, NULL, NULL, NULL, 0);
-      if ((timeinfo.tm_min != clockMin) && (NTPsyncAtLeastOnce == 1))
-      {
-        Serial.printf(" - Time not set");
-        if (ENABLE_AUTO_TIME_SET >= 1)
-        {
-          Serial.printf("\n");
-          delay(5000);
-          GoToHour((float)clockHr);
-          GoToMinute((float)clockMin);
+    Serial.printf("\n");
+  }
 
-          if (ENABLE_AUTO_TIME_SET == 1) ENABLE_AUTO_TIME_SET = 0;
-        }
+  if ((IsCalibrated == 1) && (disableCalibration == 0) && (ENABLE_AUTO_TIME_SET == 1) && (NTPsyncAtLeastOnce == 1) && (clockEnabled == 1))
+  {
+    int clockHr, clockMin;
+    int hr12, hr24;
+    getClockTime(&clockHr, &clockMin, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+    int hrMatch = 0;
+    if (ENABLE_FORCE_12H == 0)
+    {
+      if (timeinfo.tm_hour == clockHr) hrMatch = 1;
+    }
+    else
+    {
+      hr12 = timeinfo.tm_hour;
+      hr24 = timeinfo.tm_hour;
+      if (hr12 == 0) hr12 = 12;
+      if (hr12 > 12) hr12 -= 12;
+      if (hr12 == clockHr) hrMatch = 1;
+    }
+    if (hrMatch == 0)
+    {
+      Serial.printf("Setting hour.\n");
+      delay(2500);
+      if (ENABLE_FORCE_12H == 0)
+      {
+        GoToHour((float)timeinfo.tm_hour);
+      }
+      else
+      {
+         GoToHour((float)hr12);
       }
     }
-    Serial.printf("\n");
+
+    Serial.printf("Setting minute.\n");
+    delay(2500);
+    timeStatus = FetchTheTime(&timeinfo, &globalRawTime);
+    GoToMinute((float)timeinfo.tm_min);
+
+    timeStatus = FetchTheTime(&timeinfo, &globalRawTime);
+    hrMatch = 0;
+    if (ENABLE_FORCE_12H == 0)
+    {
+      if (timeinfo.tm_hour == clockHr) hrMatch = 1;
+    }
+    else
+    {
+      hr12 = timeinfo.tm_hour;
+      hr24 = timeinfo.tm_hour;
+      if (hr12 == 0) hr12 = 12;
+      if (hr12 > 12) hr12 -= 12;
+      if (hr12 == clockHr) hrMatch = 1;
+    }
+    if (hrMatch == 0)
+    {
+      Serial.printf("Setting hour.\n");
+      delay(2500);
+      if (ENABLE_FORCE_12H == 0)
+      {
+        GoToHour((float)timeinfo.tm_hour);
+      }
+      else
+      {
+         GoToHour((float)hr12);
+      }
+    }
+
+    timeStatus = FetchTheTime(&timeinfo, &globalRawTime);
+    GoToMinute((float)timeinfo.tm_min);
+    
+    ENABLE_AUTO_TIME_SET = 0;
   }
 
   #if (1)
@@ -1629,7 +1755,7 @@ void loop() {
       }
     }
   }
-#endif
+  #endif
 
 #ifndef ESP32
   MDNS.update();
