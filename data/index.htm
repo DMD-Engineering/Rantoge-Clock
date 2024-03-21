@@ -97,7 +97,7 @@
       function sendExe_calm() {
         let clockTime = prompt("Enter time displayed on clock (HH:MM):", "");
         if (clockTime != null && clockTime != "")
-          sendExe("calm " + clockTime); 
+          sendExe("calm " + clockTime + " 120000"); 
       }
       function sendCmd() {
         var xhttp = new XMLHttpRequest();
