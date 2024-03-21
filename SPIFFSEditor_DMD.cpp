@@ -469,11 +469,11 @@ void SPIFFSEditor_DMD::handleRequest(AsyncWebServerRequest *request){
         output += "file";
 #ifdef ESP32
 		//DMD ESP32 +++
-        output += "\",\"name\":\"/";     //DMD Added for some editor reason
+        output += "\",\"name\":\"/"; //DMD: To fix no slash before file name
 		//DMD ESP32 +++
 #else
 		//DMD ESP8266 +++
-        output += "\",\"name\":\""; //DMD Removed for some editor reason
+        output += "\",\"name\":\"";  //DMD To fix extra slash before file name
 		//DMD ESP8266 +++
 #endif
         output += String(entry.name());
